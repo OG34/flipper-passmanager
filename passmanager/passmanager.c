@@ -5,7 +5,6 @@
 #include <gui/view.h>
 #include <storage/storage.h>
 #include <furi_hal_usb_hid.h>
-#include <furi_hal_random.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -362,7 +361,7 @@ static bool pin_input_cb(InputEvent* event, void* context) {
 
         submenu_reset(app->submenu);
         if(app->count == 0) {
-            submenu_add_item(app->submenu, "No entries / wrong PIN", 0, NULL, NULL);
+            submenu_add_item(app->submenu, "No entries / wrong PIN", 0, menu_item_cb, app);
         } else {
             for(size_t i = 0; i < app->count; i++) {
                 submenu_add_item(
@@ -397,6 +396,15 @@ static bool pin_input_cb(InputEvent* event, void* context) {
         true);
 
     return true;
+}
+
+static void pin_enter_cb(void* context) {
+    App* app = context;
+    with_view_model(
+        app->pin_view,
+        PinModel* m,
+        { memset(m, 0, sizeof(PinModel)); },
+        true);
 }
 
 static uint32_t pin_previous_cb(void* context) {
@@ -454,7 +462,7 @@ static void menu_item_cb(void* context, uint32_t index) {
 
 static uint32_t menu_exit_cb(void* context) {
     UNUSED(context);
-    return VIEW_NONE;
+    return ViewPin;
 }
 
 /* ------------------------------------------------------------------ */
@@ -477,6 +485,7 @@ static App* app_alloc(void) {
     view_allocate_model(app->pin_view, ViewModelTypeLockFree, sizeof(PinModel));
     view_set_draw_callback(app->pin_view, pin_draw_cb);
     view_set_input_callback(app->pin_view, pin_input_cb);
+    view_set_enter_callback(app->pin_view, pin_enter_cb);
     view_set_context(app->pin_view, app);
     view_set_previous_callback(app->pin_view, pin_previous_cb);
     view_dispatcher_add_view(app->view_dispatcher, ViewPin, app->pin_view);
