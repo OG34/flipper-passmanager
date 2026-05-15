@@ -1,14 +1,13 @@
 # Flipper Zero Pass Manager
 
-A minimal password manager for the Flipper Zero. It reads a XOR-encrypted
-file from the SD card, unlocks it with a 4-digit PIN entered on the device,
-shows a scrollable list of entries, and can type credentials into any
+A password manager for the Flipper Zero. It reads a ChaCha20-encrypted
+file from the SD card, unlocks it with a 6-digit PIN entered on the device,
+shows a scrollable list of entries, and types credentials into any
 USB-connected host via BadUSB HID.
 
 ## Password file
 
-The file must be XOR-encrypted with your PIN before copying to the SD card.
-Create a plaintext file first:
+Create a plaintext file in this format:
 
 ```
 name|username|password
@@ -20,12 +19,13 @@ Example (`passwords.txt`):
 GitHub|myuser|s3cr3tpass
 WiFi Home|admin|routerpass123
 Email|john@example.com|emailpass!
+SSH Server|root|topsecret
 ```
 
-Then encrypt it with the companion tool:
+Encrypt it with the companion tool before copying to the SD card:
 
 ```sh
-python3 tools/encrypt_passwords.py 1234 passwords.txt passwords_enc.txt
+python3 tools/encrypt_passwords.py encrypt 123456 passwords.txt passwords_enc.txt
 ```
 
 Copy the **encrypted** file to:
@@ -34,26 +34,29 @@ Copy the **encrypted** file to:
 /ext/apps/Tools/passwords.txt
 ```
 
-To verify the encrypted file decrypts correctly, run the same command again
-(XOR is symmetric — applying it twice with the same PIN restores the original):
+To verify decryption works before copying:
 
 ```sh
-python3 tools/encrypt_passwords.py 1234 passwords_enc.txt
+python3 tools/encrypt_passwords.py decrypt 123456 passwords_enc.txt
 ```
+
+This prints the plaintext to stdout. If it matches your original file the
+encryption is correct.
 
 ## Encryption
 
-The file is XOR-encrypted with the PIN string used as a repeating key.
-
 | Detail | Value |
 |---|---|
-| Algorithm | XOR (symmetric stream cipher) |
-| Key | 4-digit PIN as ASCII bytes (`"1234"` → `0x31 0x32 0x33 0x34`) |
-| Key length | 4 bytes, repeating |
+| Algorithm | ChaCha20 (RFC 7539) |
+| Key size | 32 bytes |
+| Nonce | 12 bytes, random per encryption |
+| Key derivation | PIN → 32-byte key via 10 000 mixing rounds |
+| PIN length | 6 decimal digits (000000 – 999999) |
+| File format | `[12-byte nonce][ChaCha20 ciphertext]` |
 
-The decrypted buffer is zeroed in memory before being freed. XOR with a
-short PIN is lightweight and deters casual SD-card inspection; it is **not**
-cryptographically strong — do not rely on it as your only security layer.
+Each encryption run produces a different nonce, so the same plaintext
+never produces the same ciphertext. The derived key and decrypted buffer
+are zeroed in memory immediately after use.
 
 ## Build
 
@@ -73,7 +76,7 @@ Copy the compiled `.fap` to `/ext/apps/Tools/` on the SD card.
 
 ## Usage
 
-1. Encrypt `passwords.txt` with your PIN and copy it to the SD card (see above).
+1. Encrypt `passwords.txt` with your 6-digit PIN and copy it to the SD card (see above).
 2. Connect the Flipper to a host via USB (the app handles HID mode switching).
 3. Open the target login form on the host and click the **username** field.
 4. Launch **Pass Manager** from the Apps → Tools menu.
@@ -97,17 +100,32 @@ Copy the compiled `.fap` to `/ext/apps/Tools/` on the SD card.
   `! @ # $ % ^ & * ( ) - _ = + [ { ] } \ | ; : ' " ` ~ , < . > / ?` and space.
 - Unknown characters are silently skipped.
 
+## Repository layout
+
+```
+passmanager/
+  passmanager.c       # Application source (ChaCha20 + BadUSB)
+  application.fam     # Flipper build manifest
+tools/
+  encrypt_passwords.py  # Pure-Python companion tool (no external deps)
+passwords.txt.example   # Plaintext example — DO NOT copy this to the Flipper
+```
+
 ## Limits
 
 | Constraint | Value |
 |---|---|
-| PIN length | 4 digits (0000 – 9999) |
+| PIN length | 6 digits (000000 – 999999) |
 | Max entries | 64 |
 | Max field length | 63 chars |
 | Max file size | 12 400 bytes |
 
 ## Security note
 
-XOR with a short PIN is a lightweight obfuscation layer, not strong
-encryption. For high-value credentials, use full-disk encryption on the SD
-card or store only the credentials you are comfortable losing.
+ChaCha20 with a 6-digit PIN provides strong stream-cipher confidentiality for
+the file at rest. The 10 000-round key derivation raises the cost of
+brute-forcing all 1 000 000 PIN combinations.
+
+Typical threat model: someone physically finds your SD card and cannot read
+the credential file without your PIN. This does **not** protect against
+keyloggers on the host machine or an attacker who has already obtained your PIN.
