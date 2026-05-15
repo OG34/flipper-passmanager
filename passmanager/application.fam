@@ -1,0 +1,13 @@
+App(
+    appid="passmanager",
+    name="Pass Manager",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="passmanager_app",
+    requires=["gui", "storage"],
+    stack_size=2 * 1024,
+    fap_category="Tools",
+    fap_icon="passmanager_icon.png",
+    fap_version=(1, 0),
+    fap_description="Password manager that reads name|user|pass from passwords.txt",
+    fap_author="og34",
+)
