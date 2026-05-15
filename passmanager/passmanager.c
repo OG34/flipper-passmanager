@@ -184,7 +184,7 @@ static size_t load_entries(PassEntry* entries, size_t max, const char* pin) {
         if(file_size > 0 && file_size <= MAX_FILE_SIZE) {
             uint8_t* buf = malloc(file_size + 1);
             if(buf) {
-                uint32_t nread = storage_file_read(file, buf, (uint32_t)file_size);
+                uint16_t nread = storage_file_read(file, buf, (uint16_t)file_size);
                 buf[nread] = '\0';
 
                 xor_crypt(buf, nread, pin);
@@ -378,8 +378,13 @@ static uint32_t menu_exit_cb(void* context) {
 
 static App* app_alloc(void) {
     App* app = malloc(sizeof(App));
+    if(!app) return NULL;
     memset(app, 0, sizeof(App));
     app->entries = malloc(sizeof(PassEntry) * MAX_ENTRIES);
+    if(!app->entries) {
+        free(app);
+        return NULL;
+    }
 
     app->gui             = furi_record_open(RECORD_GUI);
     app->view_dispatcher = view_dispatcher_alloc();
@@ -429,14 +434,17 @@ static void app_free(App* app) {
     furi_record_close(RECORD_GUI);
     /* zero sensitive data before freeing */
     memset(app->pin, 0, sizeof(app->pin));
-    memset(app->entries, 0, sizeof(PassEntry) * MAX_ENTRIES);
-    free(app->entries);
+    if(app->entries) {
+        memset(app->entries, 0, sizeof(PassEntry) * MAX_ENTRIES);
+        free(app->entries);
+    }
     free(app);
 }
 
 int32_t passmanager_app(void* p) {
     UNUSED(p);
     App* app = app_alloc();
+    if(!app) return -1;
     view_dispatcher_run(app->view_dispatcher);
     app_free(app);
     return 0;
