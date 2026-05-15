@@ -5,6 +5,7 @@
 #include <gui/view.h>
 #include <storage/storage.h>
 #include <furi_hal_usb_hid.h>
+#include <furi_hal_random.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -15,15 +16,18 @@
 #define MAX_FILE_SIZE     (MAX_ENTRIES * (size_t)LINE_BUF_LEN)
 #define HID_KEY_DELAY_MS  15
 #define HID_ENUM_DELAY_MS 1000
-#define PIN_LENGTH        4
+#define PIN_LENGTH        6
 
-/* PIN box geometry (128x64 screen) */
-#define PIN_BOX_W   20
+/* PIN box geometry (128x64 screen, 6 digits: 6*16 + 5*3 = 111px wide) */
+#define PIN_BOX_W   16
 #define PIN_BOX_H   24
-#define PIN_BOX_GAP 4
+#define PIN_BOX_GAP 3
 #define PIN_BOX_Y   18
-/* total width = PIN_LENGTH*BOX_W + (PIN_LENGTH-1)*GAP = 4*20+3*4 = 92 */
 #define PIN_BOX_X0  ((128 - (PIN_LENGTH * PIN_BOX_W + (PIN_LENGTH - 1) * PIN_BOX_GAP)) / 2)
+
+/* ChaCha20 */
+#define CHACHA20_KEY_SIZE   32
+#define CHACHA20_NONCE_SIZE 12
 
 typedef struct {
     char name[MAX_FIELD_LEN];
@@ -58,7 +62,6 @@ typedef struct {
     App* app;
 } DetailModel;
 
-/* forward declaration needed by pin_input_cb */
 static void menu_item_cb(void* context, uint32_t index);
 
 /* ------------------------------------------------------------------ */
@@ -135,19 +138,95 @@ static void hid_type_entry(const PassEntry* e) {
 }
 
 /* ------------------------------------------------------------------ */
-/* XOR encryption (symmetric: same function encrypts and decrypts)    */
+/* ChaCha20 stream cipher (RFC 7539)                                  */
 /* ------------------------------------------------------------------ */
 
-static void xor_crypt(uint8_t* data, size_t len, const char* pin) {
+#define ROTL32(v, n) (((uint32_t)(v) << (n)) | ((uint32_t)(v) >> (32u - (n))))
+
+#define QR(a, b, c, d) do { \
+    (a) += (b); (d) ^= (a); (d) = ROTL32((d), 16); \
+    (c) += (d); (b) ^= (c); (b) = ROTL32((b), 12); \
+    (a) += (b); (d) ^= (a); (d) = ROTL32((d),  8); \
+    (c) += (d); (b) ^= (c); (b) = ROTL32((b),  7); \
+} while(0)
+
+static void chacha20_block(const uint32_t key[8], uint32_t ctr,
+                           const uint32_t nonce[3], uint8_t out[64]) {
+    static const uint32_t C[4] = {
+        0x61707865u, 0x3320646eu, 0x79622d32u, 0x6b206574u
+    };
+    uint32_t s[16], w[16];
+
+    s[0]  = C[0];     s[1]  = C[1];     s[2]  = C[2];     s[3]  = C[3];
+    s[4]  = key[0];   s[5]  = key[1];   s[6]  = key[2];   s[7]  = key[3];
+    s[8]  = key[4];   s[9]  = key[5];   s[10] = key[6];   s[11] = key[7];
+    s[12] = ctr;      s[13] = nonce[0]; s[14] = nonce[1]; s[15] = nonce[2];
+
+    for(int i = 0; i < 16; i++) w[i] = s[i];
+
+    for(int i = 0; i < 10; i++) {
+        QR(w[0], w[4], w[ 8], w[12]); QR(w[1], w[5], w[ 9], w[13]);
+        QR(w[2], w[6], w[10], w[14]); QR(w[3], w[7], w[11], w[15]);
+        QR(w[0], w[5], w[10], w[15]); QR(w[1], w[6], w[11], w[12]);
+        QR(w[2], w[7], w[ 8], w[13]); QR(w[3], w[4], w[ 9], w[14]);
+    }
+
+    for(int i = 0; i < 16; i++) {
+        uint32_t v = w[i] + s[i];
+        out[i * 4]     = (uint8_t)(v);
+        out[i * 4 + 1] = (uint8_t)(v >>  8);
+        out[i * 4 + 2] = (uint8_t)(v >> 16);
+        out[i * 4 + 3] = (uint8_t)(v >> 24);
+    }
+}
+
+static void chacha20_xor(const uint8_t key[CHACHA20_KEY_SIZE],
+                         const uint8_t nonce_bytes[CHACHA20_NONCE_SIZE],
+                         uint8_t* data, size_t len) {
+    uint32_t k[8], n[3];
+    uint8_t  stream[64];
+
+    for(int i = 0; i < 8; i++)
+        k[i] = (uint32_t)key[i*4]         | ((uint32_t)key[i*4+1] <<  8)
+             | ((uint32_t)key[i*4+2] << 16) | ((uint32_t)key[i*4+3] << 24);
+    for(int i = 0; i < 3; i++)
+        n[i] = (uint32_t)nonce_bytes[i*4]         | ((uint32_t)nonce_bytes[i*4+1] <<  8)
+             | ((uint32_t)nonce_bytes[i*4+2] << 16) | ((uint32_t)nonce_bytes[i*4+3] << 24);
+
+    for(uint32_t blk = 0; (size_t)blk * 64 < len; blk++) {
+        chacha20_block(k, blk, n, stream);
+        size_t off = (size_t)blk * 64;
+        size_t end = off + 64 < len ? off + 64 : len;
+        for(size_t j = off; j < end; j++) data[j] ^= stream[j - off];
+    }
+    memset(stream, 0, sizeof(stream));
+}
+
+/* ------------------------------------------------------------------ */
+/* Key derivation: PIN → 32-byte key (10 000 mixing rounds)           */
+/* ------------------------------------------------------------------ */
+
+static void derive_key(const char* pin, uint8_t key[CHACHA20_KEY_SIZE]) {
     size_t pin_len = strlen(pin);
-    if(!pin_len) return;
-    for(size_t i = 0; i < len; i++) {
-        data[i] ^= (uint8_t)pin[i % pin_len];
+    for(size_t i = 0; i < CHACHA20_KEY_SIZE; i++)
+        key[i] = (uint8_t)pin[i % pin_len];
+
+    for(uint32_t r = 0; r < 10000; r++) {
+        uint16_t carry = 0;
+        for(size_t i = 0; i < CHACHA20_KEY_SIZE; i++) {
+            uint16_t v = (uint16_t)key[i]
+                       + (uint16_t)key[(i + 1) % CHACHA20_KEY_SIZE]
+                       + carry
+                       + (uint8_t)pin[r % pin_len];
+            key[i] = (uint8_t)(v & 0xFF);
+            carry  = v >> 8;
+        }
     }
 }
 
 /* ------------------------------------------------------------------ */
 /* File loading                                                        */
+/* File format: [12-byte random nonce][ChaCha20 ciphertext]           */
 /* ------------------------------------------------------------------ */
 
 static void parse_line(const char* line, PassEntry* e) {
@@ -175,39 +254,49 @@ static void parse_line(const char* line, PassEntry* e) {
 
 static size_t load_entries(PassEntry* entries, size_t max, const char* pin) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
-    File* file = storage_file_alloc(storage);
-    size_t count = 0;
+    File*    file    = storage_file_alloc(storage);
+    size_t   count   = 0;
 
     if(storage_file_open(file, PASSWORDS_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
         uint64_t file_size = storage_file_size(file);
+        uint64_t max_size  = (uint64_t)MAX_FILE_SIZE + CHACHA20_NONCE_SIZE;
 
-        if(file_size > 0 && file_size <= MAX_FILE_SIZE) {
-            uint8_t* buf = malloc(file_size + 1);
+        if(file_size > CHACHA20_NONCE_SIZE && file_size <= max_size) {
+            uint8_t* buf = malloc((size_t)file_size + 1);
             if(buf) {
                 uint16_t nread = storage_file_read(file, buf, (uint16_t)file_size);
-                buf[nread] = '\0';
 
-                xor_crypt(buf, nread, pin);
+                if((size_t)nread > CHACHA20_NONCE_SIZE) {
+                    uint8_t  key[CHACHA20_KEY_SIZE];
+                    uint8_t* nonce      = buf;
+                    uint8_t* ciphertext = buf + CHACHA20_NONCE_SIZE;
+                    size_t   ct_len     = (size_t)nread - CHACHA20_NONCE_SIZE;
 
-                char* p = (char*)buf;
-                char* file_end = p + nread;
-                while(p < file_end && count < max) {
-                    char* line_end = memchr(p, '\n', (size_t)(file_end - p));
-                    if(line_end) *line_end = '\0';
+                    derive_key(pin, key);
+                    chacha20_xor(key, nonce, ciphertext, ct_len);
+                    memset(key, 0, sizeof(key));
 
-                    size_t line_len = strlen(p);
-                    while(line_len && p[line_len - 1] == '\r') p[--line_len] = '\0';
+                    ciphertext[ct_len] = '\0';
 
-                    if(line_len > 0 && strchr(p, '|')) {
-                        memset(&entries[count], 0, sizeof(PassEntry));
-                        parse_line(p, &entries[count]);
-                        if(entries[count].name[0]) count++;
+                    char* p        = (char*)ciphertext;
+                    char* file_end = p + ct_len;
+                    while(p < file_end && count < max) {
+                        char* line_end = memchr(p, '\n', (size_t)(file_end - p));
+                        if(line_end) *line_end = '\0';
+
+                        size_t line_len = strlen(p);
+                        while(line_len && p[line_len - 1] == '\r') p[--line_len] = '\0';
+
+                        if(line_len > 0 && strchr(p, '|')) {
+                            memset(&entries[count], 0, sizeof(PassEntry));
+                            parse_line(p, &entries[count]);
+                            if(entries[count].name[0]) count++;
+                        }
+                        p = line_end ? line_end + 1 : file_end;
                     }
-                    p = line_end ? line_end + 1 : file_end;
                 }
 
-                /* zero decrypted data before freeing */
-                memset(buf, 0, file_size + 1);
+                memset(buf, 0, (size_t)file_size + 1);
                 free(buf);
             }
         }
@@ -249,9 +338,7 @@ static void pin_draw_cb(Canvas* canvas, void* model_ptr) {
             AlignCenter,
             digit_str);
 
-        if(i == (int)m->cursor) {
-            canvas_invert_color(canvas);
-        }
+        if(i == (int)m->cursor) canvas_invert_color(canvas);
     }
 
     canvas_draw_line(canvas, 0, 51, 127, 51);
@@ -263,10 +350,9 @@ static bool pin_input_cb(InputEvent* event, void* context) {
     App* app = context;
 
     if(event->type != InputTypeShort && event->type != InputTypeRepeat) return false;
-    if(event->key == InputKeyBack) return false; /* previous_cb exits app */
+    if(event->key == InputKeyBack) return false;
 
     if(event->key == InputKeyOk && event->type == InputTypeShort) {
-        /* read digits without holding model across the heavy work below */
         PinModel* m = view_get_model(app->pin_view);
         for(int i = 0; i < PIN_LENGTH; i++) app->pin[i] = '0' + m->digits[i];
         app->pin[PIN_LENGTH] = '\0';
@@ -344,9 +430,8 @@ static void detail_draw_cb(Canvas* canvas, void* model_ptr) {
 static bool detail_input_cb(InputEvent* event, void* context) {
     App* app = context;
     if(event->type == InputTypeShort && event->key == InputKeyOk) {
-        if(app->selected_idx < app->count) {
+        if(app->selected_idx < app->count)
             hid_type_entry(&app->entries[app->selected_idx]);
-        }
         return true;
     }
     return false;
@@ -381,17 +466,13 @@ static App* app_alloc(void) {
     if(!app) return NULL;
     memset(app, 0, sizeof(App));
     app->entries = malloc(sizeof(PassEntry) * MAX_ENTRIES);
-    if(!app->entries) {
-        free(app);
-        return NULL;
-    }
+    if(!app->entries) { free(app); return NULL; }
 
     app->gui             = furi_record_open(RECORD_GUI);
     app->view_dispatcher = view_dispatcher_alloc();
     view_dispatcher_enable_queue(app->view_dispatcher);
     view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
 
-    /* PIN view */
     app->pin_view = view_alloc();
     view_allocate_model(app->pin_view, ViewModelTypeLockFree, sizeof(PinModel));
     view_set_draw_callback(app->pin_view, pin_draw_cb);
@@ -400,12 +481,10 @@ static App* app_alloc(void) {
     view_set_previous_callback(app->pin_view, pin_previous_cb);
     view_dispatcher_add_view(app->view_dispatcher, ViewPin, app->pin_view);
 
-    /* submenu (populated after PIN confirmed) */
     app->submenu = submenu_alloc();
     view_set_previous_callback(submenu_get_view(app->submenu), menu_exit_cb);
     view_dispatcher_add_view(app->view_dispatcher, ViewMenu, submenu_get_view(app->submenu));
 
-    /* detail view */
     app->detail_view = view_alloc();
     view_allocate_model(app->detail_view, ViewModelTypeLockFree, sizeof(DetailModel));
     {
@@ -432,7 +511,6 @@ static void app_free(App* app) {
     view_free(app->detail_view);
     view_dispatcher_free(app->view_dispatcher);
     furi_record_close(RECORD_GUI);
-    /* zero sensitive data before freeing */
     memset(app->pin, 0, sizeof(app->pin));
     if(app->entries) {
         memset(app->entries, 0, sizeof(PassEntry) * MAX_ENTRIES);
