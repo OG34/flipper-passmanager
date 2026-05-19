@@ -56,7 +56,8 @@ encryption is correct.
 
 Each encryption run produces a different nonce, so the same plaintext
 never produces the same ciphertext. The derived key and decrypted buffer
-are zeroed in memory immediately after use.
+are zeroed in memory immediately after use. Entries are also wiped when
+the user returns to the PIN screen or the auto-lock timer fires.
 
 ## Build
 
@@ -82,15 +83,18 @@ Copy the compiled `.fap` to `/ext/apps/Tools/` on the SD card.
 4. Launch **Pass Manager** from the Apps → Tools menu.
 5. On the **PIN screen**: use **Up / Down** to change the highlighted digit,
    **Left / Right** to move between digits, **OK** to confirm.
+   - Wrong PIN → error message appears on the PIN screen, try again.
 6. If the PIN is correct the entry list appears. Scroll with **Up / Down**,
    select with **OK**.
-7. The detail screen shows the entry name, username, and password.
+7. The detail screen shows the entry name and username. The password is
+   displayed as `********` to prevent shoulder-surfing.
 8. Press **OK** to type: the Flipper switches to USB HID, waits ~1 s for
    host enumeration, then types `<username>` **Tab** `<password>`.
-9. Press **Back** to return to the list; press **Back** again to exit.
+9. Press **Back** to return to the list; press **Back** again to return to
+   the PIN screen (entries are wiped from RAM).
 
-> If "No entries / wrong PIN" appears, the PIN was incorrect or the file is
-> missing. Press **Back** and try again.
+> **Auto-lock:** if no entry is typed for 60 seconds the app automatically
+> wipes entries from RAM and returns to the PIN screen.
 
 ### HID typing details
 
