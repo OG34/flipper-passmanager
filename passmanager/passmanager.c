@@ -16,6 +16,8 @@
 #define HID_KEY_DELAY_MS  15
 #define HID_ENUM_DELAY_MS 1000
 #define PIN_LENGTH        6
+#define AUTO_LOCK_MS      (60 * 1000)
+#define EVENT_LOCK        0u
 
 /* PIN box geometry (128x64 screen, 6 digits: 6*16 + 5*3 = 111px wide) */
 #define PIN_BOX_W   16
@@ -50,11 +52,13 @@ typedef struct {
     View*           pin_view;
     Submenu*        submenu;
     View*           detail_view;
+    FuriTimer*      lock_timer;
 } App;
 
 typedef struct {
     uint8_t digits[PIN_LENGTH];
     uint8_t cursor;
+    bool    error;
 } PinModel;
 
 typedef struct {
@@ -308,8 +312,42 @@ static size_t load_entries(PassEntry* entries, size_t max, const char* pin) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Auto-lock                                                           */
+/* ------------------------------------------------------------------ */
+
+static void lock_timer_cb(void* context) {
+    App* app = context;
+    view_dispatcher_send_custom_event(app->view_dispatcher, EVENT_LOCK);
+}
+
+static bool app_custom_event_cb(void* context, uint32_t event) {
+    App* app = context;
+    if(event == EVENT_LOCK) {
+        view_dispatcher_switch_to_view(app->view_dispatcher, ViewPin);
+        return true;
+    }
+    return false;
+}
+
+/* ------------------------------------------------------------------ */
 /* PIN entry view                                                      */
 /* ------------------------------------------------------------------ */
+
+static void pin_enter_cb(void* context) {
+    App* app = context;
+    furi_timer_stop(app->lock_timer);
+    if(app->count > 0) {
+        memset(app->entries, 0, sizeof(PassEntry) * MAX_ENTRIES);
+        app->count        = 0;
+        app->selected_idx = 0;
+        submenu_reset(app->submenu);
+    }
+    with_view_model(
+        app->pin_view,
+        PinModel* m,
+        { memset(m, 0, sizeof(PinModel)); },
+        true);
+}
 
 static void pin_draw_cb(Canvas* canvas, void* model_ptr) {
     PinModel* m = model_ptr;
@@ -342,7 +380,11 @@ static void pin_draw_cb(Canvas* canvas, void* model_ptr) {
 
     canvas_draw_line(canvas, 0, 51, 127, 51);
     canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str_aligned(canvas, 64, 62, AlignCenter, AlignBottom, "OK: Confirm");
+    if(m->error) {
+        canvas_draw_str_aligned(canvas, 64, 62, AlignCenter, AlignBottom, "Wrong PIN — try again");
+    } else {
+        canvas_draw_str_aligned(canvas, 64, 62, AlignCenter, AlignBottom, "OK: Confirm");
+    }
 }
 
 static bool pin_input_cb(InputEvent* event, void* context) {
@@ -359,23 +401,25 @@ static bool pin_input_cb(InputEvent* event, void* context) {
 
         app->count = load_entries(app->entries, MAX_ENTRIES, app->pin);
 
-        submenu_reset(app->submenu);
         if(app->count == 0) {
-            submenu_add_item(app->submenu, "No entries / wrong PIN", 0, menu_item_cb, app);
+            with_view_model(app->pin_view, PinModel* m, { m->error = true; }, true);
         } else {
+            submenu_reset(app->submenu);
             for(size_t i = 0; i < app->count; i++) {
                 submenu_add_item(
                     app->submenu, app->entries[i].name, (uint32_t)i, menu_item_cb, app);
             }
+            furi_timer_start(app->lock_timer, AUTO_LOCK_MS);
+            view_dispatcher_switch_to_view(app->view_dispatcher, ViewMenu);
         }
-        view_dispatcher_switch_to_view(app->view_dispatcher, ViewMenu);
         return true;
     }
 
     with_view_model(
         app->pin_view,
-        PinModel * m,
+        PinModel* m,
         {
+            m->error = false;
             switch(event->key) {
             case InputKeyUp:
                 m->digits[m->cursor] = (m->digits[m->cursor] + 1) % 10;
@@ -396,15 +440,6 @@ static bool pin_input_cb(InputEvent* event, void* context) {
         true);
 
     return true;
-}
-
-static void pin_enter_cb(void* context) {
-    App* app = context;
-    with_view_model(
-        app->pin_view,
-        PinModel* m,
-        { memset(m, 0, sizeof(PinModel)); },
-        true);
 }
 
 static uint32_t pin_previous_cb(void* context) {
@@ -429,7 +464,7 @@ static void detail_draw_cb(Canvas* canvas, void* model_ptr) {
     canvas_draw_str(canvas, 0, 26, "User:");
     canvas_draw_str(canvas, 32, 26, e->user);
     canvas_draw_str(canvas, 0, 38, "Pass:");
-    canvas_draw_str(canvas, 32, 38, e->pass);
+    canvas_draw_str(canvas, 32, 38, "********");
 
     canvas_draw_line(canvas, 0, 51, 127, 51);
     canvas_draw_str(canvas, 2, 62, "OK:Type  Back:Menu");
@@ -438,6 +473,7 @@ static void detail_draw_cb(Canvas* canvas, void* model_ptr) {
 static bool detail_input_cb(InputEvent* event, void* context) {
     App* app = context;
     if(event->type == InputTypeShort && event->key == InputKeyOk) {
+        furi_timer_start(app->lock_timer, AUTO_LOCK_MS);
         if(app->selected_idx < app->count)
             hid_type_entry(&app->entries[app->selected_idx]);
         return true;
@@ -480,6 +516,9 @@ static App* app_alloc(void) {
     app->view_dispatcher = view_dispatcher_alloc();
     view_dispatcher_enable_queue(app->view_dispatcher);
     view_dispatcher_attach_to_gui(app->view_dispatcher, app->gui, ViewDispatcherTypeFullscreen);
+    view_dispatcher_set_custom_event_callback(app->view_dispatcher, app_custom_event_cb, app);
+
+    app->lock_timer = furi_timer_alloc(lock_timer_cb, FuriTimerTypeOnce, app);
 
     app->pin_view = view_alloc();
     view_allocate_model(app->pin_view, ViewModelTypeLockFree, sizeof(PinModel));
@@ -512,6 +551,8 @@ static App* app_alloc(void) {
 }
 
 static void app_free(App* app) {
+    furi_timer_stop(app->lock_timer);
+    furi_timer_free(app->lock_timer);
     view_dispatcher_remove_view(app->view_dispatcher, ViewPin);
     view_dispatcher_remove_view(app->view_dispatcher, ViewMenu);
     view_dispatcher_remove_view(app->view_dispatcher, ViewDetail);
