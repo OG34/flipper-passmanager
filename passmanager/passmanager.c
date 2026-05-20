@@ -1,12 +1,14 @@
 #include <furi.h>
+#include <furi_hal.h>
 #include <gui/gui.h>
 #include <gui/view_dispatcher.h>
 #include <gui/modules/submenu.h>
 #include <gui/view.h>
 #include <storage/storage.h>
-#include <furi_hal_usb_hid.h>
 #include <string.h>
 #include <stdlib.h>
+
+extern const FuriHalUsbInterface usb_hid;
 
 #define PASSWORDS_PATH    "/ext/apps/Tools/passwords.txt"
 #define MAX_ENTRIES       64
@@ -127,7 +129,7 @@ static void hid_type_string(const char* str) {
 }
 
 static void hid_type_entry(const PassEntry* e) {
-    const FuriHalUsbInterface* prev = furi_hal_usb_get_config();
+    FuriHalUsbInterface* prev = (FuriHalUsbInterface*)furi_hal_usb_get_config();
     furi_hal_usb_set_config(&usb_hid, NULL);
     furi_delay_ms(HID_ENUM_DELAY_MS);
 
