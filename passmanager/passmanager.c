@@ -130,7 +130,7 @@ static void hid_type_string(const char* str) {
 
 static void hid_type_entry(const PassEntry* e) {
     FuriHalUsbInterface* prev = (FuriHalUsbInterface*)furi_hal_usb_get_config();
-    furi_hal_usb_set_config(&usb_hid, NULL);
+    furi_hal_usb_set_config((FuriHalUsbInterface*)&usb_hid, NULL);
     furi_delay_ms(HID_ENUM_DELAY_MS);
 
     hid_type_string(e->user);
@@ -383,7 +383,7 @@ static void pin_draw_cb(Canvas* canvas, void* model_ptr) {
     canvas_draw_line(canvas, 0, 51, 127, 51);
     canvas_set_font(canvas, FontSecondary);
     if(m->error) {
-        canvas_draw_str_aligned(canvas, 64, 62, AlignCenter, AlignBottom, "Wrong PIN — try again");
+        canvas_draw_str_aligned(canvas, 64, 62, AlignCenter, AlignBottom, "Wrong PIN - try again");
     } else {
         canvas_draw_str_aligned(canvas, 64, 62, AlignCenter, AlignBottom, "OK: Confirm");
     }
