@@ -3,7 +3,7 @@ App(
     name="Pass Manager",
     apptype=FlipperAppType.EXTERNAL,
     entry_point="passmanager_app",
-    requires=["gui", "storage", "usb_hid"],
+    requires=["gui", "storage"],
     stack_size=4 * 1024,
     fap_category="Tools",
     fap_version=(1, 1),
